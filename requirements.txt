@@ -1,0 +1,22 @@
+# --- Core data / SQL ---
+pandas>=2.2,<3
+duckdb>=1.1
+sqlglot>=25.0
+sqlalchemy>=2.0,<3
+psycopg2-binary>=2.9        # PostgreSQL driver (control-plane DB)
+
+# --- Config / validation ---
+pydantic>=2.7,<3
+pydantic-settings>=2.3
+python-dotenv>=1.0
+
+# --- LLM providers (provider-agnostic: select via LLM_PROVIDER) ---
+groq>=0.11
+google-genai>=0.3           # Gemini (new unified SDK)
+
+# --- API ---
+fastapi>=0.110
+uvicorn[standard]>=0.29
+
+# --- Testing ---
+pytest>=8.0
