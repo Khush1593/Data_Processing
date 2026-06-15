@@ -49,12 +49,22 @@ export interface TableSummary {
   clarifications: Clarification[];
 }
 
+export interface CrossTableGroup {
+  group_type: string;
+  label: string;
+  canonical_format: string;
+  canonical_reason: string;
+  tables_matching: string[];
+  tables_needing_patch: string[];
+}
+
 export interface ProjectStatus {
   project_id: string;
   db_uri: string;
   schema: string | null;
   status: string;
   error: string | null;
+  cross_table_summary: CrossTableGroup[];
   tables: TableSummary[];
 }
 
@@ -68,7 +78,7 @@ export interface TableDetail {
       null_pct: number;
       distinct_count: number;
       sample_values: string[];
-      inferred_issue: string | null;
+      inferred_issues: string[];
     }[];
   };
   cleaning_sql: string;

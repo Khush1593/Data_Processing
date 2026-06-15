@@ -23,6 +23,7 @@ from typing import Callable, Type, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from app.config import get_settings
+from app.debug_logger import DebugLogger
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -118,6 +119,31 @@ def _extract_json(raw: str) -> dict:
     raise LLMError(f"Could not extract JSON from LLM response: {raw[:200]!r}")
 
 
+# Substrings that mark an error as pointless to retry: a quota/daily-limit or
+# auth/bad-model failure will NOT clear within a few hundred ms of backoff, and
+# retrying a quota error burns yet another request against the same exhausted
+# daily quota. Detect these and stop immediately.
+_NON_RETRYABLE_MARKERS = (
+    "resource_exhausted",
+    "quota",
+    "429",
+    "insufficient_quota",
+    "invalid api key",
+    "api_key_invalid",
+    "permission_denied",
+    "unauthorized",
+    "401",
+    "403",
+    "not found",
+    "404",
+)
+
+
+def _is_non_retryable(err: Exception) -> bool:
+    msg = str(err).lower()
+    return any(marker in msg for marker in _NON_RETRYABLE_MARKERS)
+
+
 def _generate_structured(
     prompt: str,
     response_schema: Type[T],
@@ -126,6 +152,7 @@ def _generate_structured(
     api_key: str | None = None,
     temperature: float | None = None,
     max_retries: int | None = None,
+    debug: DebugLogger | None = None,
 ) -> T:
     """Call the active LLM provider and parse the response into ``response_schema``.
 
@@ -151,14 +178,30 @@ def _generate_structured(
 
     last_err: Exception | None = None
     for attempt in range(retries + 1):
+        raw: str | None = None
         try:
             raw = call(prompt, model, api_key, temperature, timeout)
             data = _extract_json(raw)
-            return response_schema.model_validate(data)
+            result = response_schema.model_validate(data)
+            if debug:
+                debug.llm_call(
+                    f"LLM call ({provider}/{model}, attempt {attempt + 1}) — OK",
+                    prompt, raw_response=raw,
+                )
+            return result
         except (LLMError, ValidationError) as e:
             last_err = e
         except Exception as e:  # transient network/provider errors
             last_err = e
+        if debug:
+            debug.llm_call(
+                f"LLM call ({provider}/{model}, attempt {attempt + 1}) — FAILED",
+                prompt, raw_response=raw, error=str(last_err),
+            )
+        # Quota/auth/not-found errors won't clear on retry — stop now rather
+        # than waste more requests against an already-exhausted daily quota.
+        if _is_non_retryable(last_err):
+            raise LLMError(f"LLM generation failed (non-retryable): {last_err}")
         if attempt < retries:
             time.sleep(0.5 * (attempt + 1))
 

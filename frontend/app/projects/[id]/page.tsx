@@ -329,6 +329,40 @@ export default function ProjectPage() {
         </div>
       )}
 
+      {project.cross_table_summary && project.cross_table_summary.length > 0 && (
+        <div className="mb-6 rounded-lg border border-zinc-200 bg-white p-5 shadow-sm">
+          <h2 className="text-sm font-semibold uppercase tracking-wide text-zinc-500">
+            Cross-table consistency
+          </h2>
+          <p className="mt-1 text-sm text-zinc-500">
+            These columns appear in multiple tables. A single canonical format was chosen
+            for each group, and the cleaning SQL for any non-matching table was adjusted to
+            match — this is intentional cross-table alignment, not a mistake.
+          </p>
+          <div className="mt-3 space-y-3">
+            {project.cross_table_summary.map((g, i) => (
+              <div key={i} className="rounded-md border border-zinc-100 bg-zinc-50 p-3 text-sm">
+                <p className="font-medium text-zinc-900">{g.label}</p>
+                <p className="mt-0.5 text-zinc-600">
+                  Canonical format: <span className="font-mono">{g.canonical_format}</span>{" "}
+                  ({g.canonical_reason})
+                </p>
+                {g.tables_matching.length > 0 && (
+                  <p className="mt-1 text-zinc-600">
+                    Already matches: {g.tables_matching.join(", ")}
+                  </p>
+                )}
+                {g.tables_needing_patch.length > 0 && (
+                  <p className="mt-1 text-zinc-600">
+                    Adjusted: {g.tables_needing_patch.join(", ")}
+                  </p>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className="space-y-4">
         {project.tables.map((t) => (
           <TableCard

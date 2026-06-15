@@ -28,9 +28,8 @@ from app.preprocessing.ast_validator import SQLValidationError, validate_cleanin
 from app.preprocessing.cache_engine import get_project_duckdb_path, run_cold_start
 from app.preprocessing.connector import get_table_metadata
 from app.preprocessing.dry_run import run_dry_run
-from app.preprocessing.profiler import enrich_metadata_with_sample
+from app.preprocessing.profiler import build_cleaning_script, enrich_metadata_with_sample
 from app.preprocessing.sampler import extract_stratified_sample
-from app.preprocessing.script_generator import generate_cleaning_script
 from tests.fixtures import build_source
 
 PROJECT_ID = "demo_project"
@@ -77,13 +76,13 @@ def main() -> None:
           f"sync_mode={metadata.detected_sync_mode}")
     print(f"  stratified sample held in memory: {len(sample)} rows")
     for c in metadata.columns:
-        if c.inferred_issue:
-            print(f"    issue: {c.name:12} -> {c.inferred_issue:18} e.g. {c.sample_values[:2]}")
+        if c.inferred_issues:
+            print(f"    issue: {c.name:12} -> {', '.join(c.inferred_issues):18} e.g. {c.sample_values[:2]}")
 
     # -------------------------------------------------------- generate script
     banner(2, "GENERATE — cleaning SQL (LLM if key set, else built-in)")
     if settings.active_api_key:
-        script = generate_cleaning_script(metadata, sample)
+        script = build_cleaning_script(metadata, sample)
         print(f"  source={script.source}  (live LLM)")
         if script.source == "deterministic_fallback":
             print("  LLM call failed; using built-in cleaning SQL instead.")

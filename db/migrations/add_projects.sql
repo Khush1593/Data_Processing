@@ -36,5 +36,8 @@ CREATE TABLE IF NOT EXISTS table_analyses (
 ALTER TABLE table_analyses ADD COLUMN IF NOT EXISTS clarifications_json TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE table_analyses ADD COLUMN IF NOT EXISTS clarification_answers_json TEXT NOT NULL DEFAULT '{}';
 
+-- Stage 0.5 (stage0_v3_spec.md) — cross-table consistency summary.
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS cross_table_summary_json TEXT NOT NULL DEFAULT '[]';
+
 CREATE INDEX IF NOT EXISTS idx_table_analyses_project
     ON table_analyses (project_id);

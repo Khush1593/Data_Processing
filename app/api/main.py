@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.projects import router as projects_router
 from app.db import init_db
+from app.preprocessing.orchestrator import resume_incomplete_cold_starts
 
 app = FastAPI(title="Clarum Insights — Stage 0 Review")
 
@@ -25,6 +26,9 @@ app.add_middleware(
 @app.on_event("startup")
 def _startup() -> None:
     init_db()
+    # Crash recovery: resume any cold starts that were interrupted by a
+    # previous worker restart/crash (cold_start_progress.status='in_progress').
+    resume_incomplete_cold_starts()
 
 
 @app.get("/health")

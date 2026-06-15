@@ -78,6 +78,10 @@ class Project(Base):
     # 'analyzing' | 'ready' | 'approving' | 'completed' | 'failed'
     status = Column(String, nullable=False, default="analyzing")
     error = Column(Text, nullable=True)
+    # Stage 0.5 (stage0_v3_spec.md) — JSON list of cross-table consistency
+    # groups found (dates/phones/IDs), canonical format + reason per group,
+    # and which tables matched vs. were patched.
+    cross_table_summary_json = Column(Text, nullable=False, default="[]")
     created_at = Column(DateTime(timezone=True), default=_utcnow)
 
 

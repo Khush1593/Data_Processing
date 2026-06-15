@@ -6,3 +6,4 @@ projects/*.duckdb
 .pytest_cache/
 /tmp/
 *.egg-info/
+debug_logs/

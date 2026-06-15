@@ -51,7 +51,25 @@ class Settings(BaseSettings):
     PREPROCESSING_RECONCILIATION_THRESHOLD: float = 0.005
     PREPROCESSING_ENABLED: bool = True
 
+    # ----- v3.0 Column Intelligence Gate -----
+    # distinct_sample_ratio (distinct_count / naive-chunk row count) above
+    # which a STRING column with no detected issues is classified FREE_TEXT
+    # (excluded from cleaning/LLM as free-form prose). A ratio, not an
+    # absolute count, because distinct_count is capped at the naive chunk
+    # size and so could never exceed a fixed absolute threshold.
+    PREPROCESSING_FREE_TEXT_CARDINALITY_RATIO: float = 0.95
+    # Minimum distinct_count required alongside the ratio above, so a tiny
+    # table (e.g. 5 all-unique rows) isn't misclassified as free-form prose.
+    PREPROCESSING_FREE_TEXT_MIN_DISTINCT: int = 20
+
     DUCKDB_CACHE_DIR: str = "projects"
+
+    # ----- Debug logging -----
+    # When enabled, every step of analyze/approve (profiling, issue
+    # detection, LLM prompt + raw response, AST validation, dry-run diff) is
+    # written to a per-table markdown file under DEBUG_LOG_DIR for review.
+    PREPROCESSING_DEBUG_LOG: bool = False
+    DEBUG_LOG_DIR: str = "debug_logs"
 
     @field_validator("LLM_PROVIDER", mode="before")
     @classmethod

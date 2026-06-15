@@ -71,27 +71,27 @@ def _extract(engine: Engine, table_name: str, schema: str | None) -> TableMetada
         row_count = conn.execute(text(f"SELECT COUNT(*) FROM {qtable}")).scalar() or 0
 
         null_pcts: dict[str, float] = {}
-        distinct_counts: dict[str, int] = {}
-        for cd in col_defs:
-            col = cd["name"]
-            qcol = _q(engine, col)
-            if row_count > 0:
-                null_pcts[col] = (
-                    conn.execute(
-                        text(
-                            f"SELECT CAST(SUM(CASE WHEN {qcol} IS NULL THEN 1 ELSE 0 END) AS FLOAT)"
-                            f" / NULLIF(COUNT(*), 0) FROM {qtable}"
-                        )
-                    ).scalar()
-                    or 0.0
-                )
-                distinct_counts[col] = (
-                    conn.execute(text(f"SELECT COUNT(DISTINCT {qcol}) FROM {qtable}")).scalar()
-                    or 0
-                )
-            else:
-                null_pcts[col] = 0.0
-                distinct_counts[col] = 0
+        if row_count > 0 and col_defs:
+            # Single full-table-scan query computing every column's null
+            # count, instead of one scan per column (N scans on an N-column
+            # table). Deliberately does NOT compute COUNT(DISTINCT ...) — a
+            # hash-aggregate per column over the full table is exactly the
+            # kind of heavy analytics this connector must not impose on the
+            # client's live DB. distinct_count is instead estimated locally
+            # from the in-memory sample (see sampler.extract_stratified_sample).
+            select_parts = []
+            for cd in col_defs:
+                qcol = _q(engine, cd["name"])
+                select_parts.append(f"SUM(CASE WHEN {qcol} IS NULL THEN 1 ELSE 0 END)")
+            agg_query = f"SELECT {', '.join(select_parts)} FROM {qtable}"
+            row = conn.execute(text(agg_query)).fetchone()
+            for i, cd in enumerate(col_defs):
+                col = cd["name"]
+                null_count = row[i] or 0
+                null_pcts[col] = float(null_count) / row_count
+        else:
+            for cd in col_defs:
+                null_pcts[cd["name"]] = 0.0
 
     columns: list[ColumnMetadata] = []
     change_tracking_col: str | None = None
@@ -118,7 +118,7 @@ def _extract(engine: Engine, table_name: str, schema: str | None) -> TableMetada
                 name=col_name,
                 declared_type=data_type,
                 null_pct=float(null_pcts.get(col_name, 0.0)),
-                distinct_count=int(distinct_counts.get(col_name, 0)),
+                distinct_count=0,  # filled in locally from the sample (see sampler)
                 is_primary_key=(col_name == primary_key_col),
                 has_created_at=is_created,
                 has_updated_at=is_updated,

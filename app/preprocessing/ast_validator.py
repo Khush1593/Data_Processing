@@ -53,8 +53,27 @@ def validate_cleaning_sql(sql: str, table_name: str) -> str:
                 f"Destructive operation detected: {type(node).__name__}"
             )
 
+    # Reject table-valued function calls used as a row source (e.g.
+    # read_csv_auto('/etc/passwd'), read_parquet('s3://...'), glob(...)) —
+    # these would let LLM-authored SQL read arbitrary files/URLs instead of
+    # the expected source table.
+    for table in statement.find_all(exp.Table):
+        if isinstance(table.this, (exp.Anonymous, exp.Func)):
+            raise SQLValidationError(
+                f"Table-valued function call detected in FROM clause: "
+                f"{table.this.sql(dialect='duckdb')}"
+            )
+
+    # Exactly one base table, and it must be the expected source table — no
+    # JOINs, subquery-from-other-tables, etc. The cleaning SQL is a SELECT
+    # over a single table's columns; pulling in a second table would let
+    # LLM-authored SQL read data outside what was profiled/sampled.
     from_tables = [t.name.lower() for t in statement.find_all(exp.Table)]
-    if from_tables and table_name.lower() not in from_tables:
-        raise SQLValidationError(f"SQL references unexpected tables: {from_tables}")
+    if len(from_tables) != 1:
+        raise SQLValidationError(
+            f"Cleaning SQL must reference exactly one table, found: {from_tables}"
+        )
+    if from_tables[0] != table_name.lower():
+        raise SQLValidationError(f"SQL references unexpected table: {from_tables[0]}")
 
     return sql.strip()

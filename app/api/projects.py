@@ -69,9 +69,9 @@ def get_project(project_id: str, db: Session = Depends(get_db)):
         metadata = json.loads(a.metadata_json) if a.metadata_json != "{}" else {}
         diff = json.loads(a.diff_json) if a.diff_json != "{}" else {}
         issues = [
-            {"column": c["name"], "issue": c["inferred_issue"]}
+            {"column": c["name"], "issue": ", ".join(c["inferred_issues"])}
             for c in metadata.get("columns", [])
-            if c.get("inferred_issue")
+            if c.get("inferred_issues")
         ]
         tables.append({
             "table_name": a.table_name,
@@ -93,6 +93,7 @@ def get_project(project_id: str, db: Session = Depends(get_db)):
         "schema": project.source_schema,
         "status": project.status,
         "error": project.error,
+        "cross_table_summary": json.loads(project.cross_table_summary_json or "[]"),
         "tables": tables,
     }
 

@@ -21,8 +21,7 @@ from app.db import init_db, session_scope
 from app.memory_engine import write_memory
 from app.preprocessing.ast_validator import SQLValidationError, validate_cleaning_sql
 from app.preprocessing.cache_engine import get_project_duckdb_path, run_cold_start
-from app.preprocessing.profiler import profile_table
-from app.preprocessing.script_generator import generate_cleaning_script
+from app.preprocessing.profiler import build_cleaning_script, profile_table
 
 SOURCE_URI = "postgresql+psycopg2://postgres:postgres@localhost:5432/postgres"
 SCHEMA = "clarum_test"
@@ -47,15 +46,15 @@ def run_table(table: str, do_cold_start: bool) -> dict:
     print(f"  rows={metadata.row_count}  pk={metadata.primary_key_column}  "
           f"sync_mode={metadata.detected_sync_mode}  change_col={metadata.change_tracking_column}")
 
-    issues = {c.name: c.inferred_issue for c in metadata.columns if c.inferred_issue}
+    issues = {c.name: c.inferred_issues for c in metadata.columns if c.inferred_issues}
     print("  detected issues:")
-    for name, issue in issues.items():
+    for name, issue_list in issues.items():
         col = next(c for c in metadata.columns if c.name == name)
-        print(f"    {name:22} -> {issue:18} samples={col.sample_values[:3]}")
+        print(f"    {name:22} -> {', '.join(issue_list):18} samples={col.sample_values[:3]}")
     if not issues:
         print("    (none detected)")
 
-    script = generate_cleaning_script(metadata, sample)
+    script = build_cleaning_script(metadata, sample)
     print(f"  cleaning script source: {script.source}")
     print(f"  columns_transformed: {script.columns_transformed}")
 

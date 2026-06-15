@@ -4,3 +4,8 @@ cd frontend && npm run dev                                  # frontend → http:
 
 DB: postgresql+psycopg2://postgres:postgres@localhost:5432/postgres
 schema: clarum_test
+
+Test2: postgresql+psycopg2://postgres:postgres@localhost:5432/clarum_test2
+
+
+1 Pound sterling = 1.34 United States Dollar, 1.00 EUR = 1.15 USD. use these values and keep everything is USD, the values which does not have currency sign assume that are already in USD.
