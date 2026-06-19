@@ -116,6 +116,7 @@ export interface DiffPage {
   page_size: number;
   total_changed: number;
   columns: string[];
+  column_types: Record<string, { before: string; after: string }>;
   rows: DiffRow[];
 }
 

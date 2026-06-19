@@ -89,6 +89,8 @@ export default function TableComparePage() {
                   <tbody>
                     {data.columns.map((col) => {
                       const changed = row.changed_columns.includes(col);
+                      const types = data.column_types?.[col];
+                      const typeChanged = !!types && types.before !== types.after;
                       return (
                         <tr
                           key={col}
@@ -96,7 +98,21 @@ export default function TableComparePage() {
                             changed ? "" : "text-zinc-400"
                           }`}
                         >
-                          <td className="px-4 py-1.5 font-mono text-xs">{col}</td>
+                          <td className="px-4 py-1.5 font-mono text-xs">
+                            <div>{col}</div>
+                            {types && (
+                              <div className="mt-0.5 text-[10px] font-normal text-zinc-400">
+                                {typeChanged ? (
+                                  <>
+                                    {types.before} <span className="text-zinc-300">→</span>{" "}
+                                    <span className="text-zinc-500">{types.after}</span>
+                                  </>
+                                ) : (
+                                  types.before
+                                )}
+                              </div>
+                            )}
+                          </td>
                           <td className="px-4 py-1.5 font-mono text-xs">
                             {changed ? (
                               <span className="rounded bg-red-50 px-1.5 py-0.5 text-red-700 line-through decoration-red-400">

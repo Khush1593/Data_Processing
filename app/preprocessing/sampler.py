@@ -468,6 +468,9 @@ def detect_date_format(sample_col: pd.Series) -> str | None:
         return f"%d{sep}%m{sep}%Y"
     if month_first_evidence:
         return f"%m{sep}%d{sep}%Y"
-    # Ambiguous (every value <= 12 in both positions): default to day-first,
-    # the more common convention outside the US.
-    return f"%d{sep}%m{sep}%Y"
+    # Genuinely ambiguous: every value has both components <= 12, so
+    # day-first and month-first are equally plausible and a silent guess
+    # could be wrong for every row. Return None so the column is classified
+    # CLEAN_AMBIG and a human is asked (Human-in-the-Loop), instead of
+    # defaulting to one convention.
+    return None

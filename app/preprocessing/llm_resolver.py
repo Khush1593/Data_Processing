@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.debug_logger import DebugLogger
 from app.llm_engine import _generate_structured
@@ -25,6 +25,7 @@ from app.preprocessing.expression_builder import (
     build_expression,
     build_passthrough,
 )
+from app.preprocessing.fallback_guard import guard
 from app.preprocessing.models import ClassifiedColumn, ColumnExpression, ColumnMetadata
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,26 @@ class ResolutionItem(BaseModel):
     sql_exprs: list[str] = Field(default_factory=list)
     clarification_question: Optional[str] = None
     clarification_options: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_singular_field_names(cls, data):
+        """Observed (Groq openai/gpt-oss-120b, single-output non-split
+        resolutions): the model writes ``sql_expr``/``output_name``
+        (singular) instead of the schema's ``sql_exprs``/``output_names``
+        arrays — the expression itself is correct, just shaped for "one
+        value" instead of the (rarely used) multi-output currency-split
+        case. Without this, the singular keys are silently dropped by
+        ``extra=\"ignore\"``, the arrays default to empty, and a perfectly
+        good resolution gets discarded as if the LLM had failed.
+        """
+        if not isinstance(data, dict):
+            return data
+        if not data.get("sql_exprs") and data.get("sql_expr"):
+            data = {**data, "sql_exprs": [data["sql_expr"]]}
+        if not data.get("output_names") and data.get("output_name"):
+            data = {**data, "output_names": [data["output_name"]]}
+        return data
 
 
 class ResolverResponse(BaseModel):
@@ -99,6 +120,11 @@ Clarification rules:
   "Leave as text" as a final option.
 - Still provide a best-effort sql_exprs/output_names even when action="clarify", so
   the script remains valid if the user never answers.
+- If the issue is mixed_date_format and you cannot confidently determine whether
+  the format is US (MM/DD/YYYY) or International (DD/MM/YYYY) from the samples
+  (e.g. every day and month component is <= 12), you MUST set action="clarify"
+  and provide exactly these clarification_options, in this order:
+  ["MM/DD/YYYY (US)", "DD/MM/YYYY (International)", "Leave as text"].
 
 Respond ONLY with a JSON object: {"resolutions": [...]}, one entry per input column."""
 
@@ -150,6 +176,12 @@ def _build_prompt(
 
 def _parse_resolution(res: ResolutionItem, col: ColumnMetadata) -> ColumnExpression:
     output_names = res.output_names or [col.name]
+    if not res.sql_exprs:
+        guard(
+            f"Column '{col.name}': LLM resolver response had no usable "
+            f"sql_exprs (action={res.action!r}) — would fall back to a bare "
+            f"passthrough, silently dropping any transformation/conversion."
+        )
     sql_exprs = res.sql_exprs or [_q(col.name)]
 
     return ColumnExpression(
@@ -229,6 +261,11 @@ def resolve_ambiguous(
                     "LLM resolver omitted column '%s' — using deterministic fallback",
                     c.column.name,
                 )
+                guard(
+                    f"Column '{c.column.name}': LLM resolver omitted this "
+                    f"column from its response — would fall back to "
+                    f"deterministic expression."
+                )
                 expressions.append(_deterministic_fallback(c))
 
         if debug:
@@ -245,6 +282,11 @@ def resolve_ambiguous(
                 "LLM resolver FAILED — deterministic fallback applied for all ambiguous columns",
                 str(exc),
             )
+        guard(
+            f"LLM resolver failed ({exc}) for {len(ambiguous)} ambiguous "
+            f"column(s) ({[c.column.name for c in ambiguous]}) — would fall "
+            f"back to deterministic expressions for all of them."
+        )
         return [_deterministic_fallback(c) for c in ambiguous]
 
 
@@ -300,5 +342,11 @@ def apply_clarification_answer(col: ColumnMetadata, answer: str) -> ColumnExpres
     logger.warning(
         "Could not interpret clarification answer %r for column '%s' — "
         "deterministic fallback applied.", answer, col.name,
+    )
+    guard(
+        f"Column '{col.name}': clarification answer {answer!r} did not "
+        f"match any known pattern (split/leave-as-text/date-format/"
+        f"fraction/percent) — would fall back to deterministic expression, "
+        f"silently dropping the user's instruction."
     )
     return build_expression(col, [i for i in (col.inferred_issues or [])])

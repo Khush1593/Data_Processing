@@ -1,20 +1,23 @@
-"""Stage 0 v3.0 — metadata profiler + cleaning-script builder
-(stage0_v3_spec.md §10-11).
+"""Stage 0 v3.1 — metadata profiler + cleaning-script builder.
 
 :func:`profile_table` connects, extracts structural metadata, pre-classifies
-every column (Column Intelligence Gate), pulls a stratified sample of every
-column (so ``dry_run`` can later execute the full assembled SELECT), and
-enriches only candidate columns with their top sample values and inferred
-cleaning issues. PII/IDENTIFIER/STRUCTURAL columns get empty
-``sample_values``/``inferred_issues`` and so never reach the LLM, even though
-their raw values are present in the in-memory sample DataFrame.
+every column (Column Intelligence Gate — now AI-augmented in the orchestrator),
+pulls a stratified sample, and enriches candidate columns with sample values,
+issue ratios, and format signatures for Stage 0.5.
 
-:func:`build_cleaning_script` takes that profiled metadata + sample and
-produces a :class:`CleaningScript`: post-classifies every column, builds a
-deterministic ``ColumnExpression`` for CLEAN_DET/OBSERVE/SKIP columns, sends
-only the CLEAN_AMBIG columns (if any) to the focused LLM resolver, then
-assembles the final SELECT. Per-column expression slots mean a column can
-never be silently "skipped".
+:func:`build_cleaning_script` (v3.1) takes profiled metadata + sample and
+produces a :class:`CleaningScript`:
+
+  1. Classify columns with pre_classify() and apply AI overrides
+     (``col_class_overrides``).  PII/IDENTIFIER/STRUCTURAL → passthrough.
+  2. FREE_TEXT columns (detected via post-sampling heuristics) → passthrough.
+  3. All remaining OBSERVE columns (including what was CLEAN_DET/CLEAN_AMBIG
+     in v3.0) → Self-Healing Exception Capture (Step 4):
+       - Determine target type from column name/type/values.
+       - Run exception capture query in DuckDB.
+       - AI patches specific failures and is verified empirically.
+       - Falls back to deterministic TRY_CAST when AI patch cannot be verified.
+  4. User column_overrides are still honoured via the legacy LLM resolver.
 """
 from __future__ import annotations
 
@@ -26,6 +29,7 @@ import pandas as pd
 
 from app.debug_logger import DebugLogger
 from app.preprocessing.column_classifier import (
+    _is_free_text,
     _is_identifier,
     _name_tokens,
     needs_sample,
@@ -34,6 +38,7 @@ from app.preprocessing.column_classifier import (
     summary,
 )
 from app.preprocessing.connector import get_table_metadata
+from app.preprocessing.exception_capture import run_exception_capture
 from app.preprocessing.expression_builder import build_expression, build_passthrough
 from app.preprocessing.llm_resolver import (
     _deterministic_fallback,
@@ -144,10 +149,16 @@ def _date_format_signature(col: ColumnMetadata, sample_col: pd.Series) -> str | 
 def profile_table(
     db_uri: str, table_name: str, schema: str | None = None,
     debug: DebugLogger | None = None,
+    prefetched_metadata: TableMetadata | None = None,
 ) -> tuple[TableMetadata, pd.DataFrame]:
     """Profile a source table: structural metadata + targeted stratified
-    sample + issue detection, restricted to non-SKIP (candidate) columns."""
-    metadata = get_table_metadata(db_uri, table_name, schema=schema)
+    sample + issue detection, restricted to non-SKIP (candidate) columns.
+
+    ``prefetched_metadata``: pass pre-fetched ``TableMetadata`` to skip the
+    ``get_table_metadata`` DB call (used by the orchestrator when it already
+    fetched all table schemas for the AI classifier).
+    """
+    metadata = prefetched_metadata or get_table_metadata(db_uri, table_name, schema=schema)
     if debug:
         debug.code("Structural metadata", metadata.model_dump(), lang="json")
 
@@ -248,9 +259,9 @@ def _option_id(label: str) -> str:
 
 def _infer_script_source(expressions: list[ColumnExpression]) -> str:
     sources = {e.source for e in expressions}
-    if "llm" in sources:
+    if "llm" in sources or "llm_patch" in sources:
         return "llm"
-    if "llm_fallback_det" in sources:
+    if "llm_fallback_det" in sources or "llm_patch_fallback_det" in sources:
         return "deterministic_fallback"
     return "deterministic"
 
@@ -274,20 +285,37 @@ def _extract_clarifications(expressions: list[ColumnExpression]) -> list[dict]:
 
 # Overrides whose instruction text is one of the simple, deterministically
 # parseable forms `apply_clarification_answer` already understands (currency
-# split / keep-as-text) — handled without an LLM call. Anything else (custom
-# free-form instructions) is forwarded to `llm_resolver` as context.
+# split / keep-as-text / date-format choice) — handled without an LLM call.
+# Anything else (custom free-form instructions) is forwarded to
+# `llm_resolver` as context.
 def _is_simple_override(instruction: str) -> bool:
     i = instruction.lower()
     return (
         "split this column into two output columns" in i
         or "leave this column completely unchanged" in i
+        # Human-in-the-Loop answer to an ambiguous mixed_date_format
+        # clarification (see llm_resolver.SYSTEM_PROMPT) — the user's choice
+        # of "MM/DD/YYYY (US)" / "DD/MM/YYYY (International)" maps directly
+        # to a TRY_STRPTIME format via apply_clarification_answer, no second
+        # LLM call needed.
+        or "mm/dd" in i
+        or "dd/mm" in i
+        or "as text" in i
     )
+
+
+_SKIP_CLASSES: frozenset[ColumnClass] = frozenset({
+    ColumnClass.PII,
+    ColumnClass.IDENTIFIER,
+    ColumnClass.STRUCTURAL,
+})
 
 
 def build_cleaning_script(
     metadata: TableMetadata,
     sample: pd.DataFrame,
     column_overrides: dict[str, str] | None = None,
+    col_class_overrides: dict[str, ColumnClass] | None = None,
     llm_provider: str | None = None,
     llm_model: str | None = None,
     api_key: str | None = None,
@@ -295,29 +323,55 @@ def build_cleaning_script(
     debug: DebugLogger | None = None,
     expression_patch: Callable[[ColumnExpression, ColumnMetadata], ColumnExpression] | None = None,
 ) -> CleaningScript:
-    """Build the per-table cleaning ``CleaningScript`` (v3.0 pipeline).
+    """Build the per-table cleaning ``CleaningScript`` (v3.1 pipeline).
 
-    Every column gets exactly one ``ColumnExpression`` slot — built
-    deterministically for CLEAN_DET/OBSERVE/SKIP/FREE_TEXT columns, and via a
-    single focused LLM call (with guaranteed deterministic fallback) for any
-    CLEAN_AMBIG columns. Columns cannot be silently skipped.
+    v3.1 replaces the heuristic CLEAN_DET/CLEAN_AMBIG classification and
+    LLM resolver path with Self-Healing Exception Capture for all OBSERVE
+    columns:
+      - Attempt standard TRY_CAST.
+      - Capture specific failures.
+      - Ask the AI to patch only those failures.
+      - Verify the patch empirically in DuckDB.
 
-    ``disable_llm``: skip the LLM resolver entirely and use the deterministic
-    fallback for every CLEAN_AMBIG column. Used to retry after the LLM-influenced
-    SQL fails AST validation, without a second LLM round-trip.
+    ``col_class_overrides``: AI-classifier upgrades from the orchestrator's
+    pre-flight Step 2 call.  Maps col_name → ColumnClass.  Can only upgrade
+    OBSERVE → PII or IDENTIFIER (never downgrade).
+
+    ``disable_llm``: skip AI patching; use deterministic TRY_CAST for all
+    OBSERVE columns. Also used for retry after AST validation failure.
+
+    Column ``column_overrides`` (user-specified free-form instructions) still
+    route through the legacy LLM resolver for full backward compatibility.
     """
     column_overrides = column_overrides or {}
-    classified = [post_classify(col) for col in metadata.columns]
+    col_class_overrides = col_class_overrides or {}
+
+    # Phase 1: classify with pre_classify() + AI gate overrides.
+    # post_classify() is still used for FREE_TEXT detection (which relies on
+    # distinct_count / distinct_sample_ratio set by enrich_metadata_with_sample).
+    post_classified = {c.column.name: c for c in (post_classify(col) for col in metadata.columns)}
+
+    classified: list[ClassifiedColumn] = []
+    for col in metadata.columns:
+        c = post_classified[col.name]
+        ai_class = col_class_overrides.get(col.name)
+        # AI can only upgrade OBSERVE (and its sub-classes) to PII/IDENTIFIER.
+        if ai_class in _SKIP_CLASSES and c.classification not in _SKIP_CLASSES:
+            c = ClassifiedColumn(col, ai_class, ["AI metadata gate"], [])
+        classified.append(c)
+
     if debug:
         debug.code(
-            "Post-classification (Column Intelligence Gate)",
-            {c.column.name: {"class": c.classification.value, "reasons": c.reasons,
-                              "active_issues": c.active_issues} for c in classified},
+            "v3.1 Classification (pre_classify + AI gate)",
+            {c.column.name: {"class": c.classification.value, "reasons": c.reasons}
+             for c in classified},
             lang="json",
         )
 
+    # Phase 2: route columns.
     expressions: list[ColumnExpression] = []
-    ambiguous: list[ClassifiedColumn] = []
+    override_ambiguous: list[ClassifiedColumn] = []
+    observe_columns: list[ClassifiedColumn] = []
 
     for c in classified:
         col = c.column
@@ -329,29 +383,42 @@ def build_cleaning_script(
             elif _is_simple_override(override):
                 expressions.append(apply_clarification_answer(col, override))
             else:
-                # Custom free-form instruction — forward to the LLM resolver
-                # as context, regardless of this column's own classification.
-                ambiguous.append(
+                # Custom free-form user instruction — route through legacy resolver.
+                override_ambiguous.append(
                     ClassifiedColumn(col, ColumnClass.CLEAN_AMBIG, ["user override"], c.active_issues)
                 )
             continue
 
-        if c.classification == ColumnClass.CLEAN_DET:
-            expressions.append(build_expression(col, c.active_issues))
-        elif c.classification == ColumnClass.CLEAN_AMBIG:
-            ambiguous.append(c)
-        else:
-            # PII, IDENTIFIER, FREE_TEXT, STRUCTURAL, OBSERVE -> passthrough.
+        if c.classification in _SKIP_CLASSES:
             expressions.append(build_passthrough(col))
+        elif c.classification == ColumnClass.FREE_TEXT:
+            expressions.append(build_passthrough(col))
+        else:
+            # OBSERVE / CLEAN_DET / CLEAN_AMBIG → exception capture (v3.1).
+            observe_columns.append(c)
 
-    if ambiguous:
+    # Resolve user-override columns via legacy LLM resolver (backward compat).
+    if override_ambiguous:
         if disable_llm:
-            expressions.extend(_deterministic_fallback(c) for c in ambiguous)
+            expressions.extend(_deterministic_fallback(c) for c in override_ambiguous)
         else:
             expressions.extend(resolve_ambiguous(
-                ambiguous, column_overrides=column_overrides,
+                override_ambiguous, column_overrides=column_overrides,
                 llm_provider=llm_provider, llm_model=llm_model, api_key=api_key, debug=debug,
             ))
+
+    # Phase 3: Self-Healing Exception Capture for all OBSERVE columns.
+    all_review_notes: list[str] = []
+    if observe_columns:
+        observe_exprs, review_notes = run_exception_capture(
+            observe_columns, sample, metadata.table_name,
+            llm_provider=llm_provider, llm_model=llm_model, api_key=api_key,
+            disable_llm=disable_llm, debug=debug,
+        )
+        expressions.extend(observe_exprs)
+        all_review_notes.extend(review_notes)
+        if debug and review_notes:
+            debug.section("Exception capture — manual review notes", "\n".join(review_notes))
 
     if expression_patch is not None:
         cols_by_name = {col.name: col for col in metadata.columns}
@@ -366,8 +433,7 @@ def build_cleaning_script(
 
     cleaning_sql = build_select(metadata.table_name, expressions)
     cls_summary = summary(classified)
-    explanation = build_audit_log(expressions, cls_summary)
-
+    explanation = build_audit_log(expressions, cls_summary, all_review_notes)
     columns_transformed = [e.col_name for e in expressions if e.source != "passthrough"]
 
     script = CleaningScript(

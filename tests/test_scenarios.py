@@ -462,6 +462,61 @@ def test_scenario_13c_apply_clarification_answer_keep_as_text():
 
 
 # --------------------------------------------------------------------------
+# Scenario 13d — Human-in-the-Loop: genuinely ambiguous mixed_date_format
+# (every day/month component <= 12) must not be silently guessed.
+# --------------------------------------------------------------------------
+def test_scenario_13d_detect_date_format_genuinely_ambiguous_returns_none():
+    import pandas as pd
+    from app.preprocessing.sampler import detect_date_format
+
+    # Every value: both day and month components <= 12 -> can't tell
+    # DD/MM from MM/DD.
+    col = pd.Series(["05/08/2023", "01/02/2022", "11/12/2021", "03/04/2020"])
+    assert detect_date_format(col) is None
+
+
+def test_scenario_13e_post_classify_ambiguous_date_is_clean_ambig():
+    col = ColumnMetadata(
+        name="hire_date", declared_type="VARCHAR(20)", null_pct=0.0, distinct_count=100,
+        inferred_issues=["mixed_date_format"], date_format=None,
+    )
+    classified = post_classify(col)
+    assert classified.classification == ColumnClass.CLEAN_AMBIG
+
+
+def test_scenario_13f_apply_clarification_answer_date_format_choice():
+    from app.preprocessing.llm_resolver import apply_clarification_answer
+
+    col = ColumnMetadata(name="hire_date", declared_type="VARCHAR", null_pct=0.0, distinct_count=100)
+
+    us = apply_clarification_answer(
+        col, "For this column, apply the following user-selected handling: MM/DD/YYYY (US)."
+    )
+    assert us.source == "llm"
+    assert "%m/%d/%Y" in us.sql_exprs[0]
+
+    intl = apply_clarification_answer(
+        col, "For this column, apply the following user-selected handling: DD/MM/YYYY (International)."
+    )
+    assert intl.source == "llm"
+    assert "%d/%m/%Y" in intl.sql_exprs[0]
+
+
+def test_scenario_13g_is_simple_override_recognizes_date_clarification():
+    from app.preprocessing.profiler import _is_simple_override
+
+    assert _is_simple_override(
+        "For this column, apply the following user-selected handling: MM/DD/YYYY (US)."
+    )
+    assert _is_simple_override(
+        "For this column, apply the following user-selected handling: DD/MM/YYYY (International)."
+    )
+    assert _is_simple_override(
+        "For this column, apply the following user-selected handling: Leave as text."
+    )
+
+
+# --------------------------------------------------------------------------
 # Scenario 14 — End-to-end: PII column never profiled / never sent to LLM
 # --------------------------------------------------------------------------
 def test_scenario_14_pii_column_excluded_from_profiling_and_llm(sqlite_uri):

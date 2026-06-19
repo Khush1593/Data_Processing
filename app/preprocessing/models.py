@@ -106,10 +106,13 @@ class ClassifiedColumn:
 
 
 ColumnSource = Literal[
-    "passthrough",      # SKIP/OBSERVE — SELECT col AS col
-    "deterministic",    # CLEAN_DET — deterministic expression
-    "llm",              # CLEAN_AMBIG — LLM resolved it
-    "llm_fallback_det",  # CLEAN_AMBIG — LLM failed, deterministic stepped in
+    "passthrough",           # SKIP/OBSERVE — SELECT col AS col
+    "deterministic",         # CLEAN_DET — deterministic expression
+    "llm",                   # CLEAN_AMBIG — LLM resolved it
+    "llm_fallback_det",      # CLEAN_AMBIG — LLM failed, deterministic stepped in
+    # v3.1 Self-Healing Exception Capture sources
+    "llm_patch",             # Step 4.7: AI patch passed verification
+    "llm_patch_fallback_det",  # Step 4.7: AI patch failed — deterministic TRY_CAST used
 ]
 
 

@@ -19,11 +19,13 @@ from app.db import session_scope
 from app.debug_logger import DebugLogger, new_run_id
 from app.memory_engine import write_memory
 from app.models import ColdStartProgress, Project, TableAnalysis
+from app.preprocessing.ai_classifier import ai_classify_tables
 from app.preprocessing.ast_validator import SQLValidationError, validate_cleaning_sql
 from app.preprocessing.cache_engine import run_cold_start
+from app.preprocessing.connector import get_table_metadata
 from app.preprocessing.cross_table_consistency import build_summary, find_groups, make_patcher
 from app.preprocessing.dry_run import run_dry_run
-from app.preprocessing.models import CleaningScript, DataQualityDiff, TableMetadata
+from app.preprocessing.models import CleaningScript, ColumnClass, DataQualityDiff, TableMetadata
 from app.preprocessing.profiler import build_cleaning_script, profile_table
 from app.preprocessing.sampler import CURRENCY_SYMBOL_TO_CODE, extract_stratified_sample
 
@@ -162,12 +164,28 @@ _ANALYZE_CONCURRENCY = 4
 def _analyze_one_table(
     project_id: str, db_uri: str, schema: str | None, table: str,
     run_id: str | None = None,
+    col_class_overrides: dict[str, ColumnClass] | None = None,
+    prefetched_metadata: TableMetadata | None = None,
 ) -> None:
-    """Profile + generate + validate + dry-run a single table; persist the result."""
+    """Profile + generate + validate + dry-run a single table; persist the result.
+
+    ``col_class_overrides``: AI Metadata Gate results from the project-level
+    pre-flight call in ``analyze_project``.  Maps col_name → ColumnClass.
+
+    ``prefetched_metadata``: structural metadata already fetched for the AI
+    classifier pre-flight; passed to ``profile_table`` to skip a redundant DB call.
+    """
     debug = DebugLogger(project_id, table, run_id=run_id)
     try:
-        metadata, sample = profile_table(db_uri, table, schema=schema, debug=debug)
-        script = build_cleaning_script(metadata, sample, debug=debug)
+        metadata, sample = profile_table(
+            db_uri, table, schema=schema, debug=debug,
+            prefetched_metadata=prefetched_metadata,
+        )
+        script = build_cleaning_script(
+            metadata, sample,
+            col_class_overrides=col_class_overrides,
+            debug=debug,
+        )
 
         # The v3.0 per-column expression model makes a column being silently
         # "skipped" structurally impossible (process.md / stage0_v3_spec.md
@@ -225,7 +243,14 @@ def _analyze_one_table(
 
 
 async def analyze_project(project_id: str, db_uri: str, schema: str | None) -> None:
-    """Profile + generate + validate + dry-run every table (concurrently); persist results."""
+    """Profile + generate + validate + dry-run every table (concurrently); persist results.
+
+    v3.1 pre-flight:
+      1. Fetch structural metadata for ALL tables in one pass.
+      2. Run the AI Metadata Gate (Step 2) once for all tables together, so
+         cross-table column context improves PII/IDENTIFIER classification.
+      3. Run per-table Steps 3-5 concurrently, injecting AI classifications.
+    """
     try:
         tables = _list_tables(db_uri, schema)
     except Exception as e:
@@ -236,13 +261,47 @@ async def analyze_project(project_id: str, db_uri: str, schema: str | None) -> N
                 project.error = f"Could not connect / list tables: {e}"
         return
 
+    # ------------------------------------------------------------------ #
+    # Step 2 pre-flight: fetch structural metadata + AI Metadata Gate
+    # ------------------------------------------------------------------ #
+    all_metadata: dict[str, TableMetadata] = {}
+    for table in tables:
+        try:
+            all_metadata[table] = get_table_metadata(db_uri, table, schema=schema)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Could not fetch metadata for table '%s' (will retry in profile_table): %s",
+                table, e,
+            )
+
+    # Single AI call covering all tables for cross-table context.
+    ai_classifications: dict[str, dict[str, ColumnClass]] = {}
+    if all_metadata:
+        try:
+            ai_classifications = ai_classify_tables(
+                all_metadata, project_id=project_id,
+            )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(
+                "AI Metadata Gate failed for project '%s' — using deterministic only: %s",
+                project_id, e,
+            )
+
+    # ------------------------------------------------------------------ #
+    # Per-table concurrent analysis (Steps 3-5) with AI context injected
+    # ------------------------------------------------------------------ #
     semaphore = asyncio.Semaphore(_ANALYZE_CONCURRENCY)
     run_id = new_run_id()  # one folder for all tables of this analyze run
 
     async def _run(table: str) -> None:
         async with semaphore:
             await asyncio.to_thread(
-                _analyze_one_table, project_id, db_uri, schema, table, run_id
+                _analyze_one_table,
+                project_id, db_uri, schema, table, run_id,
+                col_class_overrides=ai_classifications.get(table),
+                prefetched_metadata=all_metadata.get(table),
             )
 
     await asyncio.gather(*(_run(table) for table in tables))

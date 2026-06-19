@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from typing import Callable, Type, TypeVar
 
@@ -30,6 +31,41 @@ T = TypeVar("T", bound=BaseModel)
 
 class LLMError(Exception):
     """Raised when the LLM call fails or returns unparseable output."""
+
+
+# --------------------------------------------------------------------------
+# Global call throttle — see config.LLM_MAX_CONCURRENT_CALLS /
+# LLM_MIN_INTERVAL_SECONDS. Every LLM call in the process passes through
+# this gate, so columns/tables are patched one at a time (or N at a time)
+# with a minimum gap between calls, instead of every concurrently-analyzed
+# table firing its own LLM call at once and blowing a per-minute token cap.
+# --------------------------------------------------------------------------
+_call_semaphore = threading.Semaphore(get_settings().LLM_MAX_CONCURRENT_CALLS)
+_timing_lock = threading.Lock()
+_last_call_at = 0.0
+
+
+def _effective_min_interval(s) -> float:
+    """The real gap to enforce between calls: whichever is larger of the
+    flat floor and the spacing implied by the provider's RPM budget.
+
+    A flat ``LLM_MIN_INTERVAL_SECONDS`` alone is wrong whenever it's looser
+    than the provider's actual per-minute request cap (e.g. 1.5s implies
+    ~40 calls/min, but a free-tier model capped at 5 RPM needs 12s between
+    calls) — that mismatch is what produces a wave of 429 RESOURCE_EXHAUSTED
+    even though calls are already serialized one-at-a-time.
+    """
+    rpm = max(1, s.LLM_REQUESTS_PER_MINUTE)
+    return max(s.LLM_MIN_INTERVAL_SECONDS, 60.0 / rpm)
+
+
+def _throttle(min_interval: float) -> None:
+    global _last_call_at
+    with _timing_lock:
+        wait = _last_call_at + min_interval - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _last_call_at = time.monotonic()
 
 
 # --------------------------------------------------------------------------
@@ -120,13 +156,12 @@ def _extract_json(raw: str) -> dict:
 
 
 # Substrings that mark an error as pointless to retry: a quota/daily-limit or
-# auth/bad-model failure will NOT clear within a few hundred ms of backoff, and
-# retrying a quota error burns yet another request against the same exhausted
-# daily quota. Detect these and stop immediately.
+# auth/bad-model failure will NOT clear within a few seconds of backoff, and
+# retrying it burns yet another request against the same exhausted daily
+# quota. Detect these and stop immediately.
 _NON_RETRYABLE_MARKERS = (
     "resource_exhausted",
     "quota",
-    "429",
     "insufficient_quota",
     "invalid api key",
     "api_key_invalid",
@@ -138,10 +173,50 @@ _NON_RETRYABLE_MARKERS = (
     "404",
 )
 
+# A plain 429/"rate limit" (as opposed to a daily quota exhaustion above) is
+# scoped to a rolling per-minute/per-token window — it clears on its own, so
+# it's worth a longer backoff + retry rather than giving up immediately.
+_RATE_LIMIT_MARKERS = (
+    "429",
+    "rate_limit",
+    "rate limit",
+    "too many requests",
+)
+
+# Gemini's free-tier 429 RESOURCE_EXHAUSTED response contains "quota" for
+# BOTH a rolling per-minute window (quotaId "...PerMinute...", clears in
+# seconds) AND a hard daily cap (quotaId "...PerDay...", clears tomorrow).
+# Both also include a RetryInfo.retryDelay / "Please retry in Ns" — that
+# phrasing is NOT a reliable signal on its own (a first version of this
+# check used it and would have retried a daily exhaustion for no benefit).
+# Only the literal "PerMinute" quotaId name distinguishes the case that's
+# actually worth backing off and retrying for.
+_ROLLING_WINDOW_MARKERS = (
+    "per minute",
+    "perminute",
+    "per_minute",
+)
+
+# The daily-cap counterpart — kept explicit (not just "absence of the
+# per-minute marker") so a future provider wording change fails closed
+# (stays non-retryable) instead of silently starting to retry it.
+_DAILY_QUOTA_MARKERS = (
+    "per day",
+    "perday",
+    "per_day",
+)
+
 
 def _is_non_retryable(err: Exception) -> bool:
     msg = str(err).lower()
+    if any(marker in msg for marker in _ROLLING_WINDOW_MARKERS):
+        return False
     return any(marker in msg for marker in _NON_RETRYABLE_MARKERS)
+
+
+def _is_rate_limited(err: Exception) -> bool:
+    msg = str(err).lower()
+    return any(marker in msg for marker in _RATE_LIMIT_MARKERS)
 
 
 def _generate_structured(
@@ -180,7 +255,9 @@ def _generate_structured(
     for attempt in range(retries + 1):
         raw: str | None = None
         try:
-            raw = call(prompt, model, api_key, temperature, timeout)
+            with _call_semaphore:
+                _throttle(_effective_min_interval(s))
+                raw = call(prompt, model, api_key, temperature, timeout)
             data = _extract_json(raw)
             result = response_schema.model_validate(data)
             if debug:
@@ -203,6 +280,9 @@ def _generate_structured(
         if _is_non_retryable(last_err):
             raise LLMError(f"LLM generation failed (non-retryable): {last_err}")
         if attempt < retries:
-            time.sleep(0.5 * (attempt + 1))
+            if _is_rate_limited(last_err):
+                time.sleep(s.LLM_RATE_LIMIT_BACKOFF_SECONDS * (attempt + 1))
+            else:
+                time.sleep(0.5 * (attempt + 1))
 
     raise LLMError(f"LLM generation failed after {retries + 1} attempts: {last_err}")

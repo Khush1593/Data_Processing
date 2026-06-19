@@ -6,6 +6,7 @@ import os
 import pytest
 import sqlalchemy
 
+from app.config import get_settings
 from app.db import init_db, reset_engine, session_scope
 from app.models import AgentMemory, ColdStartProgress, SyncState
 
@@ -32,6 +33,17 @@ def _control_db():
     init_db()
     yield
     reset_engine()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _fast_llm_throttle():
+    """Tests register fake LLM providers (no real API, no real rate limit) —
+    the production RPM-based throttle in app.llm.engine has nothing to
+    protect here and would otherwise add ~12s of real sleep per LLM call
+    across the suite. Lift it for the test session only."""
+    s = get_settings()
+    s.LLM_REQUESTS_PER_MINUTE = 6000
+    s.LLM_MIN_INTERVAL_SECONDS = 0.0
 
 
 @pytest.fixture(autouse=True)

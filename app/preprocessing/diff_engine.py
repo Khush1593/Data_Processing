@@ -105,6 +105,7 @@ def get_diff_page(
           "page_size": page_size,
           "total_changed": int,
           "columns": [col_name, ...],
+          "column_types": {col_name: {"before": "VARCHAR", "after": "TIMESTAMP"}, ...},
           "rows": [
             {"key": <pk value or row index>,
              "before": {col: val, ...},
@@ -174,6 +175,18 @@ def get_diff_page(
              )
         """
 
+        # Column-level before/after DuckDB types (e.g. "VARCHAR" -> "TIMESTAMP"),
+        # so the review UI can show what each column was converted to/from
+        # without requiring the user to inspect raw row values.
+        src_rel = con.sql(f"SELECT * FROM ({src_cte}) t")
+        cache_rel = con.sql(f"SELECT * FROM ({cache_cte}) t")
+        src_types = dict(zip(src_rel.columns, (str(t) for t in src_rel.types)))
+        cache_types = dict(zip(cache_rel.columns, (str(t) for t in cache_rel.types)))
+        column_types = {
+            col: {"before": src_types.get(col, "?"), "after": cache_types.get(col, "?")}
+            for col in columns
+        }
+
         total_changed = con.execute(
             base_query + " SELECT COUNT(*) FROM joined"
         ).fetchone()[0]
@@ -204,6 +217,7 @@ def get_diff_page(
             "page_size": page_size,
             "total_changed": int(total_changed),
             "columns": columns,
+            "column_types": column_types,
             "rows": rows,
         }
     finally:
